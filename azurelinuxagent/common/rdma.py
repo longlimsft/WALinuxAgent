@@ -48,29 +48,21 @@ def setup_rdma_device(nd_version, shared_conf):
         return
 
     rdma_ipv4_addr = getattrib(instance_elem, "rdmaIPv4Address")
-    if not rdma_ipv4_addr:
-        logger.error(
-            "Could not find rdmaIPv4Address attribute on Instance element of SharedConfig.xml document")
-        return
-
     rdma_mac_addr = getattrib(instance_elem, "rdmaMacAddress")
-    if not rdma_mac_addr:
-        logger.error(
-            "Could not find rdmaMacAddress attribute on Instance element of SharedConfig.xml document")
-        return
-
-    # add colons to the MAC address (e.g. 00155D33FF1D ->
-    # 00:15:5D:33:FF:1D)
-    rdma_mac_addr = ':'.join([rdma_mac_addr[i:i + 2]
+    if rdma_mac_addr:
+        # add colons to the MAC address (e.g. 00155D33FF1D ->
+        # 00:15:5D:33:FF:1D)
+        rdma_mac_addr = ':'.join([rdma_mac_addr[i:i + 2]
                               for i in range(0, len(rdma_mac_addr), 2)])
-    logger.info("Found RDMA details. IPv4={0} MAC={1}".format(
+
+    if rdma_ipv4_addr and rdma_mac_addr :
+       logger.info("Found RDMA details from Wire Server. IPv4={0} MAC={1}".format(
         rdma_ipv4_addr, rdma_mac_addr))
 
-    # Set up the RDMA device with collected informatino
+    # Set up the RDMA device with collected information
     RDMADeviceHandler(rdma_ipv4_addr, rdma_mac_addr, nd_version).start()
     logger.info("RDMA: device is set up")
     return
-
 
 class RDMAHandler(object):
     driver_module_name = 'hv_network_direct'
@@ -94,13 +86,17 @@ class RDMAHandler(object):
             logger.error(error_msg % driver_info_source)
             return
 
-        f = open(driver_info_source)  # pylint: disable=C0103
+        f = open(driver_info_source, "rb")  # pylint: disable=C0103
         while True:
             key = f.read(kvp_key_size)
             value = f.read(kvp_value_size)
             if key and value:
-                key_0 = key.split("\x00")[0]
-                value_0 = value.split("\x00")[0]
+                key_0 = key.partition(b"\x00")[0]
+                if key_0 :
+                    key_0 = key_0.decode()
+                value_0 = value.partition(b"\x00")[0]
+                if value_0 :
+                    value_0 = value_0.decode()
                 if key_0 == "NdDriverVersion":
                     f.close()
                     self.nd_version = value_0
@@ -199,7 +195,7 @@ class RDMADeviceHandler(object):
     ipoib_check_interval_sec = 1
 
     ipv4_addr = None
-    mac_adr = None
+    mac_addr = None
     nd_version = None
 
     def __init__(self, ipv4_addr, mac_addr, nd_version):
@@ -265,11 +261,131 @@ class RDMADeviceHandler(object):
         RDMADeviceHandler.update_network_interface(self.mac_addr, self.ipv4_addr)
 
     def provision_sriov_rdma(self):  # pylint: disable=R1711
-        RDMADeviceHandler.wait_any_rdma_device(
-            self.sriov_dir, self.device_check_timeout_sec, self.device_check_interval_sec)
-        RDMADeviceHandler.update_iboip_interface(self.ipv4_addr, self.ipoib_check_timeout_sec,
-                                                 self.ipoib_check_interval_sec)
+        if self.ipv4_addr :
+            logger.info("RDMA: provisioning single IP over IB address");
+            # provision a single IP over IB address
+            RDMADeviceHandler.wait_any_rdma_device(self.sriov_dir,
+                self.device_check_timeout_sec, self.device_check_interval_sec)
+            RDMADeviceHandler.update_iboip_interface(self.ipv4_addr,
+                self.ipoib_check_timeout_sec, self.ipoib_check_interval_sec)
+        else :
+            # provision multiple IP over IB addresses
+            logger.info("RDMA: provisioning multiple IP over IB addresses");
+            provision_sriov_multiple_ib()
         return
+
+    def provision_sriov_mutiple_ib(self) :
+
+        # read from KVP pool 0 to figure out the IP over IB addresses
+        kvp_key_size = 512
+        kvp_value_size = 2048
+        driver_info_source = '/var/lib/hyperv/.kvp_pool_0'
+
+        if not os.path.isfile(driver_info_source):
+            logger.error("RDMA: can't read KVP pool 0")
+            return
+
+        f = open(driver_info_source, "rb")  # pylint: disable=C0103
+        while True:
+            key = f.read(kvp_key_size)
+            value = f.read(kvp_value_size)
+            if key and value:
+                key_0 = key.partition(b"\x00")[0]
+                if key_0 :
+                    key_0 = key_0.decode()
+                if key_0 == "IPoIB_Data":
+                    value_0 = value.partition(b"\x00")[0]
+                    if value_0 :
+                        value_0 = value_0.decode()
+                    break
+            else:
+                break
+        f.close()
+
+        mac_ip_array = []
+
+        if key_0 == "IPoIB_Data":
+            values = value.split("|")
+            num_ips = len(values) - 1
+            # values[0] tells how many IPs. Format - NUMPAIRS:<number>
+            match = re.match("NUMPAIRS:(\d+)", values[0])
+            if match:
+                num = int(match.groups(0)[0])
+                if num != num_ips:
+                    logger.error("RDMA: multiple IPs reported num={0} actual number of IPs={1}".format(num, num_ips))
+                    return
+            else:
+                logger.error("RDMA: failed to find number of IP addresses in {0}".format(values[0]))
+                return
+
+            for i in range(1, num_ips+1):
+                # each MAC/IP entry is of format <MAC>:<IP>
+                match = re.match("([^:]+):(\d+\.\d+\.\d+\.\d+)", values[i])
+                if match:
+                    mac_addr = match.groups(0)[0]
+                    ipv4_addr = match.groups(0)[1]
+                    mac_ip_array.append((mac_addr, ipv4_addr))
+                else:
+                    logger.error("RDMA: failed to find MAC/IP address in {0}".format(values[i]))
+                    return
+
+        # try to assign all MAC/IP addresses to IB interfaces
+        # retry for up to 60 times, with 1 seconds delay between each
+        retry = 60
+        while retry > 0:
+            count = update_iboip_interfaces(mac_ip_array)
+            if count == len(mac_ip_array):
+                return
+
+            time.sleep(1)
+            retry -= 1
+
+        logger.error("RDMA: failed to set all IP over IB addresses")
+
+    # Assign addresses to all IP over IB interfaces specified in mac_ip_array
+    # Return the number of IP addresses successfully assigned
+
+    @staticmethod
+    def update_iboip_interfaces(mac_ip_array):
+
+        net_dir = "/sys/class/net"
+        nics = os.listdir(net_dir)
+        count = 0
+
+        for nic in nics:
+            # look for IBoIP interface of format ibXXX
+            if not re.match("ib\d+", nic):
+                continue
+            f = open(net_dir + "/" + nic + "/address")
+            mac_addr = f.read()
+            f.close()
+
+            if not mac_addr:
+                logger.error("RDMA: can't read address for device {0}".format(nic))
+                continue
+
+            mac_addr = mac_addr.upper()
+
+            match = re.match(".+(\w\w):(\w\w):(\w\w):\w\w:\w\w:(\w\w):(\w\w):(\w\w)\n", mac_addr)
+            if not match:
+                logger.error("RDMA: failed to parse address for device {0} address {1}".format(nic, mac_addr))
+                continue
+
+            # format an MAC address without :
+            mac_addr = ""
+            mac_addr.join(match.groups(0))
+
+            for mac_ip in mac_ip_array:
+                if mac_ip[0] == mac_addr:
+                    r = shellutil.run("ip addr add {0} dev {1]".format(mac_ip[1], nic))
+                    if r :
+                        logger.info("RDMA: failed to set IP address {0} on device {1}".format(mac_ip[1], nic))
+                    else:
+                        count += 1
+
+                    break
+
+        return count
 
     @staticmethod
     def update_iboip_interface(ipv4_addr, timeout_sec, check_interval_sec):
